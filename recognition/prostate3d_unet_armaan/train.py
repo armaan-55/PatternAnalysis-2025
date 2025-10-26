@@ -22,7 +22,7 @@ with open(LOG_FILE, "w") as f:
 
 # Config
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 10
+EPOCHS = 20
 LR = 1e-4
 BATCH_SIZE = 1
 VISUALIZE_EVERY = 2
