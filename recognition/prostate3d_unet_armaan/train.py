@@ -12,9 +12,11 @@ import modules
 from modules import UNet3D, dice_loss, dice_coefficient
 from dataset import Prostate3DDataset, get_paired_paths
 
-# Rangpur logging functionality
+# Logs and visualization directories
 LOG_FILE = "logs/dice_per_epoch.txt"
+VIS_DIR = "logs/visualizations"
 os.makedirs("logs", exist_ok=True)
+os.makedirs(VIS_DIR, exist_ok=True)
 with open(LOG_FILE, "w") as f:
     f.write("epoch,train_loss,val_dice\n")
 
@@ -35,17 +37,22 @@ label_folder = os.path.join(base_dir, "semantic_labels_only")
 
 image_paths, label_paths = get_paired_paths(mr_folder, label_folder)
 
-# Split 90% train / 10% validation
-split_idx = int(0.9 * len(image_paths))
-train_img, val_img = image_paths[:split_idx], image_paths[split_idx:]
-train_lbl, val_lbl = label_paths[:split_idx], label_paths[split_idx:]
+# Split 80% train / 10% val / 10% test
+num_total = len(image_paths)
+train_end = int(0.8 * num_total)
+val_end = int(0.9 * num_total)
+
+train_img, val_img, test_img = image_paths[:train_end], image_paths[train_end:val_end], image_paths[val_end:]
+train_lbl, val_lbl, test_lbl = label_paths[:train_end], label_paths[train_end:val_end], label_paths[val_end:]
 
 train_dataset = Prostate3DDataset(train_img, train_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
 val_dataset = Prostate3DDataset(val_img, val_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
+test_dataset = Prostate3DDataset(test_img, test_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-print(f"Dataset ready: {len(train_dataset)} train, {len(val_dataset)} val samples")
+print(f"Dataset ready: {len(train_dataset)} train, {len(val_dataset)} val, {len(test_dataset)} test samples")
 
 # Model setup
 model = UNet3D(in_channels=1, out_channels=NUM_CLASSES, dropout_p=0.2).to(DEVICE)
@@ -53,15 +60,13 @@ optimizer = optim.Adam(model.parameters(), lr=LR)
 
 print("Model initialized:", model.__class__.__name__)
 
-# Visualization functions
-def show_3d_predictions(model, dataset, epoch=1, n=2, slice_idx=None, device='cpu'):
-    """Visualize model predictions for 3D MRI volumes."""
+# Visualization function (saves images instead of showing)
+def save_3d_predictions(model, dataset, save_dir, epoch=0, n=2, slice_idx=None, device='cpu', prefix="val"):
     model.eval()
-    fig, axes = plt.subplots(n, 3, figsize=(10, 4 * n))
-    fig.suptitle(f"Predictions After Epoch {epoch}", fontsize=16, fontweight='bold')
+    os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
-        for i in range(n):
+        for i in range(min(n, len(dataset))):
             x, y = dataset[i]
             x = x.unsqueeze(0).to(device)
             pred = model(x).cpu()
@@ -71,31 +76,28 @@ def show_3d_predictions(model, dataset, epoch=1, n=2, slice_idx=None, device='cp
             if slice_idx is None:
                 slice_idx = pred_labels.shape[2] // 2
 
-            axes[i, 0].imshow(x[0, 0, :, :, slice_idx].cpu().numpy(), cmap='gray')
-            axes[i, 0].set_title("Input MRI")
-            axes[i, 0].axis("off")
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(x[0, 0, :, :, slice_idx].cpu().numpy(), cmap='gray')
+            axes[0].set_title("Input MRI"); axes[0].axis("off")
+            axes[1].imshow(true_labels[:, :, slice_idx].numpy(), cmap="tab10")
+            axes[1].set_title("Ground Truth"); axes[1].axis("off")
+            axes[2].imshow(pred_labels[:, :, slice_idx].numpy(), cmap="tab10")
+            axes[2].set_title("Prediction"); axes[2].axis("off")
 
-            axes[i, 1].imshow(true_labels[:, :, slice_idx].numpy(), cmap="tab10")
-            axes[i, 1].set_title("Ground Truth")
-            axes[i, 1].axis("off")
-
-            axes[i, 2].imshow(pred_labels[:, :, slice_idx].numpy(), cmap="tab10")
-            axes[i, 2].set_title("Prediction")
-            axes[i, 2].axis("off")
-
-    plt.tight_layout()
-    plt.show()
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{prefix}_epoch{epoch}_sample{i}.png"))
+            plt.close(fig)
     model.train()
 
-
-def plot_losses(losses):
+def plot_losses(losses, save_path="logs/losses.png"):
     plt.figure(figsize=(6, 4))
     plt.plot(losses, 'bo-', linewidth=2)
     plt.title("Dice Loss Over Epochs", fontsize=14)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.grid(True, alpha=0.3)
-    plt.show()
+    plt.savefig(save_path)
+    plt.close()
 
 # Training loop
 def train_3d(model, train_loader, val_dataset, epochs=10, lr=1e-4, visualize_every=1, device='cpu'):
@@ -111,18 +113,16 @@ def train_3d(model, train_loader, val_dataset, epochs=10, lr=1e-4, visualize_eve
         for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-
             preds = model(x)
             loss = dice_loss(preds, y)
             loss.backward()
             optimizer.step()
-
             epoch_loss += loss.item()
 
         avg_loss = epoch_loss / len(train_loader)
         losses.append(avg_loss)
 
-        # Full validation Dice over all validation samples
+        # Validation
         model.eval()
         with torch.no_grad():
             dice_scores = []
@@ -136,20 +136,40 @@ def train_3d(model, train_loader, val_dataset, epochs=10, lr=1e-4, visualize_eve
             val_dices.append(mean_dice)
             print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Val Dice={mean_dice:.4f}")
 
-            # Logging for rangpur
             with open(LOG_FILE, "a") as f:
                 f.write(f"{epoch+1},{avg_loss:.4f},{mean_dice:.4f}\n")
+
         if (epoch + 1) % visualize_every == 0:
-            show_3d_predictions(model, val_dataset, epoch + 1, device=device)
+            save_3d_predictions(model, val_dataset, VIS_DIR, epoch+1, device=device, prefix="val")
 
     print("Training complete!")
     plot_losses(losses)
 
-    # Final average validation Dice over all epochs
+    # Final average validation Dice
     final_avg_dice = np.mean(val_dices)
     print(f"\nFinal average validation Dice over {epochs} epochs: {final_avg_dice:.4f}")
 
     return losses, val_dices
+
+# Test evaluation
+def evaluate_test(model, test_dataset, device='cpu'):
+    model.eval()
+    dice_scores = []
+
+    with torch.no_grad():
+        for i in range(len(test_dataset)):
+            x, y = test_dataset[i]
+            x = x.unsqueeze(0).to(device)
+            preds = model(x)
+            dice_val = dice_coefficient(preds, y.unsqueeze(0).to(device))
+            dice_scores.append(dice_val.item())
+
+    mean_test_dice = np.mean(dice_scores)
+    print(f"\nFinal Dice on test set: {mean_test_dice:.4f}")
+
+    # Save visualizations of test predictions
+    save_3d_predictions(model, test_dataset, VIS_DIR, epoch=0, device=device, prefix="test")
+    return mean_test_dice
 
 # Run training
 if __name__ == "__main__":
@@ -158,7 +178,10 @@ if __name__ == "__main__":
                                  visualize_every=VISUALIZE_EVERY,
                                  device=DEVICE)
 
-    # Save trained model
+    # Save model
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/unet3d_dice.pth")
     print("Model saved to checkpoints/unet3d_dice.pth")
+
+    # Evaluate on test set
+    evaluate_test(model, test_dataset, device=DEVICE)
