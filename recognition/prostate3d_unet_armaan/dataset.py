@@ -1,113 +1,150 @@
 import os
+import sys
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
-import utils
+import torch
+from torch.utils.data import Dataset
+from scipy.ndimage import zoom
 
-im = utils
+# Ensure helpers.py is imported
+sys.path.insert(0, os.path.dirname(__file__))
+import helpers
 
-# Directory
-base_dir = "./Prostate3D_local"
-
-# Input MRI volumes
-mr_folder = os.path.join(base_dir, "semantic_MRs")
-image_names = sorted([os.path.join(mr_folder, f) for f in os.listdir(mr_folder) if f.endswith(".nii.gz")])
-
-# Ground truth segmentation masks
-label_folder = os.path.join(base_dir, "semantic_labels_only")
-label_names = sorted([os.path.join(label_folder, f) for f in os.listdir(label_folder) if f.endswith(".nii.gz")])
-
-def load_data_3D(
-    imageNames,
-    normImage=False,
-    categorical=False,
-    dtype=np.float32,
-    getAffines=False,
-    orient=False,
-    early_stop=False
-):
+# 3D Data loading functions
+def load_data_3D(image_paths, normImage=False, categorical=False, dtype=np.float32,
+                 getAffines=False, orient=False, early_stop=False, num_classes=None,
+                 target_shape=None):
     """
-    Load 3D medical image data from a list of file paths.
-
-    Parameters:
-        imageNames : list of str
-            Paths to Nifti files to load.
-        normImage : bool
-            Normalize image to zero-mean, unit-variance.
-        categorical : bool
-            Convert labels to one-hot channels.
-        dtype : data type
-            np.float32 for images, np.uint8 for labels.
-        getAffines : bool
-            If True, also return affine matrices.
-        orient : bool
-            Apply orientation correction/resampling.
-        early_stop : bool
-            Stop after 20 images for quick testing/debugging.
-
-    Returns:
-        images : np.ndarray
-            Array of loaded images.
-        affines : list of np.ndarray (optional)
-            List of affine matrices if getAffines=True.
+    Load 3D medical image data from a list of NIfTI file paths.
+    If target_shape is provided, all volumes will be resized to that shape.
     """
-
     affines = []
-    interp = 'linear'
-    if dtype == np.uint8:  # assume labels
-        interp = 'nearest'
+    interp = 'linear' if dtype != np.uint8 else 'nearest'
+    num = len(image_paths)
 
-    num = len(imageNames)
-    # Load first image to determine shape
-    niftiImage = nib.load(imageNames[0])
+    # Load first image to determine shape if target_shape not given
+    niftiImage = nib.load(image_paths[0])
     if orient:
-        niftiImage = im.applyOrientation(niftiImage, interpolation=interp, scale=1)
+        niftiImage = helpers.applyOrientation(niftiImage, interpolation=interp)
+    first_case = niftiImage.get_fdata()
+    if first_case.ndim == 4:
+        first_case = first_case[:, :, :, 0]
 
-    first_case = niftiImage.get_fdata(caching='unchanged')
-    if len(first_case.shape) == 4:
-        first_case = first_case[:, :, :, 0]  # remove extra dimension if present
+    if target_shape is None:
+        target_shape = first_case.shape
 
     if categorical:
-        first_case = utils.to_channels(first_case, dtype=dtype)
-        rows, cols, depth, channels = first_case.shape
-        images = np.zeros((num, rows, cols, depth, channels), dtype=dtype)
+        shape = (num, num_classes, *target_shape)
     else:
-        rows, cols, depth = first_case.shape
-        images = np.zeros((num, rows, cols, depth), dtype=dtype)
+        shape = (num, *target_shape)
 
-    for i, inName in enumerate(tqdm(imageNames)):
-        niftiImage = nib.load(inName)
+    data = np.zeros(shape, dtype=dtype)
+
+    for i, path in enumerate(tqdm(image_paths)):
+        img = nib.load(path)
         if orient:
-            niftiImage = im.applyOrientation(niftiImage, interpolation=interp, scale=1)
+            img = helpers.applyOrientation(img, interpolation=interp)
+        arr = img.get_fdata()
+        if arr.ndim == 4:
+            arr = arr[:, :, :, 0]
 
-        inImage = niftiImage.get_fdata(caching='unchanged')
-        affine = niftiImage.affine
+        # Resize to target_shape
+        if arr.shape != target_shape:
+            zoom_factors = [t / s for t, s in zip(target_shape, arr.shape)]
+            order = 1 if dtype != np.uint8 else 0
+            arr = zoom(arr, zoom_factors, order=order)
 
-        if len(inImage.shape) == 4:
-            inImage = inImage[:, :, :, 0]
-
-        inImage = inImage[:, :, :depth].astype(dtype)
-
+        arr = arr.astype(dtype)
         if normImage:
-            inImage = (inImage - inImage.mean()) / inImage.std()
+            arr = (arr - arr.mean()) / arr.std()
 
         if categorical:
-            inImage = utils.to_channels(inImage, dtype=dtype)
-            images[i, :inImage.shape[0], :inImage.shape[1], :inImage.shape[2], :inImage.shape[3]] = inImage
-        else:
-            images[i, :inImage.shape[0], :inImage.shape[1], :inImage.shape[2]] = inImage
+            arr = helpers.to_channels(arr, num_classes=num_classes, dtype=dtype)
+            arr = np.moveaxis(arr, -1, 0)
 
-        affines.append(affine)
+        data[i] = arr
+        affines.append(img.affine)
 
-        if i > 20 and early_stop:
+        if early_stop and i > 20:
             break
 
-    if getAffines:
-        return images, affines
-    else:
-        return images
+    return (data, affines) if getAffines else data
 
-def load_dataset_3D(image_names, label_names, normImage=True, dtype=np.float32, early_stop=False):
-    images = load_data_3D(image_names, normImage=normImage, dtype=dtype, early_stop=early_stop)
-    labels = load_data_3D(label_names, normImage=False, dtype=np.uint8, early_stop=early_stop)
+def load_dataset_3D(image_paths, label_paths, normImage=True, dtype=np.float32,
+                    early_stop=False, num_classes=6, target_shape=None):
+    images = load_data_3D(image_paths, normImage=normImage, dtype=dtype, 
+                          early_stop=early_stop, target_shape=target_shape)
+    labels = load_data_3D(label_paths, normImage=False, dtype=np.uint8,
+                          early_stop=early_stop, categorical=True, 
+                          num_classes=num_classes, target_shape=target_shape)
     return images, labels
+
+# PyTorch Dataset Wrapper
+class Prostate3DDataset(Dataset):
+    def __init__(self, image_paths, label_paths, transform=None, num_classes=6, 
+                 early_stop=False, target_shape=None):
+        self.images, self.labels = load_dataset_3D(image_paths, label_paths,
+                                                   normImage=True,
+                                                   early_stop=early_stop,
+                                                   num_classes=num_classes,
+                                                   target_shape=target_shape)
+        self.transform = transform
+        self.num_classes = num_classes
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        x = self.images[idx]
+        y = self.labels[idx]
+
+        if self.transform:
+            x, y = self.transform(x, y)
+
+        x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+        y = torch.tensor(y, dtype=torch.float32)
+        return x, y
+
+# Pairing logic for MR and labels
+def get_paired_paths(mr_folder, label_folder):
+    """
+    Pair MR images and labels by patient ID (first part of filename).
+    Returns lists of paths.
+    """
+    mr_files = [f for f in os.listdir(mr_folder) if f.endswith(".nii.gz")]
+    label_files = [f for f in os.listdir(label_folder) if f.endswith(".nii.gz")]
+
+    paired_mr = []
+    paired_label = []
+
+    for label_file in label_files:
+        patient_id = label_file.split('_')[0]
+        mr_match = [f for f in mr_files if f.startswith(patient_id)]
+        if mr_match:
+            paired_mr.append(os.path.join(mr_folder, mr_match[0]))
+            paired_label.append(os.path.join(label_folder, label_file))
+
+    if len(paired_mr) == 0:
+        raise ValueError("No matching files found between MR and label folders!")
+
+    print(f"Found {len(paired_mr)} matching pairs")
+    return paired_mr, paired_label
+
+# Quick test
+if __name__ == "__main__":
+    base_dir = "../Prostate3D_local"
+    mr_folder = os.path.join(base_dir, "semantic_MRs")
+    label_folder = os.path.join(base_dir, "semantic_labels_only")
+
+    image_paths, label_paths = get_paired_paths(mr_folder, label_folder)
+    
+    target_shape = None
+    
+    dataset = Prostate3DDataset(image_paths, label_paths, early_stop=False, 
+                                target_shape=target_shape)
+    
+    print(f"\nNumber of samples: {len(dataset)}")
+    x, y = dataset[0]
+    print("Input shape:", x.shape)
+    print("Label shape:", y.shape)
