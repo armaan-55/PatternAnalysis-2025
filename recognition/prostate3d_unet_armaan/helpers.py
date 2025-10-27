@@ -10,7 +10,7 @@ from monai.transforms import (
     RandShiftIntensityd,
     RandGaussianNoised,
     ToTensord,
-    AsDiscrete
+    AsDiscreted
 )
 from monai.losses import DiceLoss, DiceCELoss
 from monai.metrics import DiceMetric
@@ -80,7 +80,7 @@ def get_train_transforms_monai(spatial_size=(96, 96, 48), num_classes=6):
             num_samples=1,
         ),
         
-        AsDiscrete(keys="label", to_onehot=num_classes),
+        AsDiscreted(keys="label", to_onehot=num_classes),
         # Convert to tensors with channel dimension
         ToTensord(keys=["image", "label"]),
     ])
@@ -97,11 +97,11 @@ def get_val_transforms_monai(spatial_size=(256, 256, 128), num_classes=6):
             spatial_size=spatial_size, 
             mode=["trilinear", "nearest"]
         ),
-        AsDiscrete(keys="label", to_onehot=num_classes),
+        AsDiscreted(keys="label", to_onehot=num_classes),
         ToTensord(keys=["image", "label"]),
     ])
 
-def get_dice_loss(include_background=False, to_onehot_y=False, softmax=True):
+def get_dice_loss(include_background=False, softmax=True):
     """
     Get MONAI's Dice Loss.
     
@@ -115,14 +115,13 @@ def get_dice_loss(include_background=False, to_onehot_y=False, softmax=True):
     """
     return DiceLoss(
         include_background=include_background,
-        to_onehot_y=to_onehot_y,
         softmax=softmax,
         squared_pred=False,  # Use standard Dice formula
         reduction="mean",
     )
 
 
-def get_dice_ce_loss(include_background=False, to_onehot_y=False, softmax=True, lambda_dice=1.0, lambda_ce=1.0):
+def get_dice_ce_loss(include_background=False, softmax=True, lambda_dice=1.0, lambda_ce=1.0):
     """
     Get combined Dice + Cross Entropy Loss (often works better!).
     
@@ -135,17 +134,15 @@ def get_dice_ce_loss(include_background=False, to_onehot_y=False, softmax=True, 
     """
     return DiceCELoss(
         include_background=include_background,
-        to_onehot_y=to_onehot_y,
         softmax=softmax,
         lambda_dice=lambda_dice,
         lambda_ce=lambda_ce,
     )
 
 
-def get_dice_metric(include_background=False, reduction="mean", get_not_nans=False, to_onehot_y=False):
+def get_dice_metric(include_background=False, reduction="mean", get_not_nans=False):
     return DiceMetric(
         include_background=include_background,
         reduction=reduction,
         get_not_nans=get_not_nans,
-        to_onehot_y=to_onehot_y,
     )
