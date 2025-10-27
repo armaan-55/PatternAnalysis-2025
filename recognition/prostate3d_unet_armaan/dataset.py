@@ -1,150 +1,113 @@
 import os
-import sys
-import numpy as np
-import nibabel as nib
-from tqdm import tqdm
 import torch
-from torch.utils.data import Dataset
-from scipy.ndimage import zoom
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd, Resized, ToTensord
+import helpers  # local helper functions
 
-# Ensure helpers.py is imported
-sys.path.insert(0, os.path.dirname(__file__))
-import helpers
+# Dataset
 
-# 3D Data loading functions
-def load_data_3D(image_paths, normImage=False, categorical=False, dtype=np.float32,
-                 getAffines=False, orient=False, early_stop=False, num_classes=None,
-                 target_shape=None):
-    """
-    Load 3D medical image data from a list of NIfTI file paths.
-    If target_shape is provided, all volumes will be resized to that shape.
-    """
-    affines = []
-    interp = 'linear' if dtype != np.uint8 else 'nearest'
-    num = len(image_paths)
-
-    # Load first image to determine shape if target_shape not given
-    niftiImage = nib.load(image_paths[0])
-    if orient:
-        niftiImage = helpers.applyOrientation(niftiImage, interpolation=interp)
-    first_case = niftiImage.get_fdata()
-    if first_case.ndim == 4:
-        first_case = first_case[:, :, :, 0]
-
-    if target_shape is None:
-        target_shape = first_case.shape
-
-    if categorical:
-        shape = (num, num_classes, *target_shape)
-    else:
-        shape = (num, *target_shape)
-
-    data = np.zeros(shape, dtype=dtype)
-
-    for i, path in enumerate(tqdm(image_paths)):
-        img = nib.load(path)
-        if orient:
-            img = helpers.applyOrientation(img, interpolation=interp)
-        arr = img.get_fdata()
-        if arr.ndim == 4:
-            arr = arr[:, :, :, 0]
-
-        # Resize to target_shape
-        if arr.shape != target_shape:
-            zoom_factors = [t / s for t, s in zip(target_shape, arr.shape)]
-            order = 1 if dtype != np.uint8 else 0
-            arr = zoom(arr, zoom_factors, order=order)
-
-        arr = arr.astype(dtype)
-        if normImage:
-            arr = (arr - arr.mean()) / arr.std()
-
-        if categorical:
-            arr = helpers.to_channels(arr, num_classes=num_classes, dtype=dtype)
-            arr = np.moveaxis(arr, -1, 0)
-
-        data[i] = arr
-        affines.append(img.affine)
-
-        if early_stop and i > 20:
-            break
-
-    return (data, affines) if getAffines else data
-
-def load_dataset_3D(image_paths, label_paths, normImage=True, dtype=np.float32,
-                    early_stop=False, num_classes=6, target_shape=None):
-    images = load_data_3D(image_paths, normImage=normImage, dtype=dtype, 
-                          early_stop=early_stop, target_shape=target_shape)
-    labels = load_data_3D(label_paths, normImage=False, dtype=np.uint8,
-                          early_stop=early_stop, categorical=True, 
-                          num_classes=num_classes, target_shape=target_shape)
-    return images, labels
-
-# PyTorch Dataset Wrapper
 class Prostate3DDataset(Dataset):
-    def __init__(self, image_paths, label_paths, transform=None, num_classes=6, 
-                 early_stop=False, target_shape=None):
-        self.images, self.labels = load_dataset_3D(image_paths, label_paths,
-                                                   normImage=True,
-                                                   early_stop=early_stop,
-                                                   num_classes=num_classes,
-                                                   target_shape=target_shape)
+    """
+    MONAI-friendly dataset that loads NIfTI volumes on-the-fly.
+    """
+    def __init__(self, data_dicts, transform=None):
+        """
+        Args:
+            data_dicts: list of dicts with keys "image" and "label"
+            transform: MONAI transform pipeline
+        """
+        self.data_dicts = data_dicts
         self.transform = transform
-        self.num_classes = num_classes
 
     def __len__(self):
-        return len(self.images)
+        return len(self.data_dicts)
 
     def __getitem__(self, idx):
-        x = self.images[idx]
-        y = self.labels[idx]
-
+        data = self.data_dicts[idx].copy()  # {'image': path, 'label': path}
         if self.transform:
-            x, y = self.transform(x, y)
+            data = self.transform(data)
+        return data
 
-        x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-        y = torch.tensor(y, dtype=torch.float32)
-        return x, y
+# Data loader
 
-# Pairing logic for MR and labels
-def get_paired_paths(mr_folder, label_folder):
+def get_dataloaders(
+    mr_folder,
+    label_folder,
+    batch_size=2,
+    num_workers=1,
+    train_spatial_size=(96, 96, 48),
+    val_spatial_size=(256, 256, 128),
+    num_classes=6,
+    seed=42,
+):
     """
-    Pair MR images and labels by patient ID (first part of filename).
-    Returns lists of paths.
+    Create train, validation, and test dataloaders using MONAI transforms.
     """
-    mr_files = [f for f in os.listdir(mr_folder) if f.endswith(".nii.gz")]
-    label_files = [f for f in os.listdir(label_folder) if f.endswith(".nii.gz")]
+    # Get all file paths as dictionaries
+    data_dicts = helpers.get_paired_paths(mr_folder, label_folder)
 
-    paired_mr = []
-    paired_label = []
+    # Split data: 80% train, 10% val, 10% test
+    np.random.seed(seed)
+    indices = np.random.permutation(len(data_dicts))
+    train_end = int(0.8 * len(data_dicts))
+    val_end = int(0.9 * len(data_dicts))
 
-    for label_file in label_files:
-        patient_id = label_file.split('_')[0]
-        mr_match = [f for f in mr_files if f.startswith(patient_id)]
-        if mr_match:
-            paired_mr.append(os.path.join(mr_folder, mr_match[0]))
-            paired_label.append(os.path.join(label_folder, label_file))
+    train_dicts = [data_dicts[i] for i in indices[:train_end]]
+    val_dicts = [data_dicts[i] for i in indices[train_end:val_end]]
+    test_dicts = [data_dicts[i] for i in indices[val_end:]]
 
-    if len(paired_mr) == 0:
-        raise ValueError("No matching files found between MR and label folders!")
+    print(f"Split: {len(train_dicts)} train, {len(val_dicts)} val, {len(test_dicts)} test")
 
-    print(f"Found {len(paired_mr)} matching pairs")
-    return paired_mr, paired_label
+    # MONAI transforms
+    base_transforms = Compose([
+            LoadImaged(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
+            ScaleIntensityd(keys=["image"]), 
+        ])
 
-# Quick test
-if __name__ == "__main__":
-    base_dir = "../Prostate3D_local"
-    mr_folder = os.path.join(base_dir, "semantic_MRs")
-    label_folder = os.path.join(base_dir, "semantic_labels_only")
+    # Combine base steps with advanced training transforms
+    train_transform_advanced = helpers.get_train_transforms_monai(
+        spatial_size=train_spatial_size, 
+        num_classes=num_classes # Pass num_classes
+    )
+    train_transform = Compose([base_transforms, train_transform_advanced]) 
 
-    image_paths, label_paths = get_paired_paths(mr_folder, label_folder)
-    
-    target_shape = None
-    
-    dataset = Prostate3DDataset(image_paths, label_paths, early_stop=False, 
-                                target_shape=target_shape)
-    
-    print(f"\nNumber of samples: {len(dataset)}")
-    x, y = dataset[0]
-    print("Input shape:", x.shape)
-    print("Label shape:", y.shape)
+    # Combine base steps with validation transforms
+    val_test_transform_advanced = helpers.get_val_transforms_monai(
+        spatial_size=val_spatial_size,
+        num_classes=num_classes # Pass num_classes
+    )
+    val_transform = Compose([base_transforms, val_test_transform_advanced])
+
+    # Datasets
+    train_ds = Prostate3DDataset(train_dicts, transform=train_transform)
+    val_ds = Prostate3DDataset(val_dicts, transform=val_transform)
+    test_ds = Prostate3DDataset(test_dicts, transform=val_transform)
+
+    # Dataloaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    return train_loader, val_loader, test_loader
