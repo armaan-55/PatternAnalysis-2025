@@ -4,6 +4,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd, Resized, ToTensord
 import helpers  # local helper functions
+from monai.data import list_data_collate
 
 # Dataset
 
@@ -64,6 +65,11 @@ def get_dataloaders(
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
             ScaleIntensityd(keys=["image"]), 
+            Resized(
+            keys=["image", "label"], 
+            spatial_size=train_spatial_size, # (96, 96, 48)
+            mode=["trilinear", "nearest"] # trilinear for image, nearest for label
+        ),
         ])
 
     # Combine base steps with advanced training transforms
@@ -92,6 +98,7 @@ def get_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn = list_data_collate
     )
 
     val_loader = DataLoader(
@@ -100,6 +107,7 @@ def get_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=list_data_collate
     )
 
     test_loader = DataLoader(
@@ -108,6 +116,7 @@ def get_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=list_data_collate
     )
 
     return train_loader, val_loader, test_loader
