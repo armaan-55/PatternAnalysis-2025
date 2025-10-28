@@ -1,6 +1,6 @@
 """
 predict.py - Evaluate trained 3D U-Net on the Prostate 3D test set.
-Computes Dice metrics and saves visualization comparisons.
+Computes Dice metrics and saves visualization comparisons using pure PyTorch functions.
 """
 
 import os
@@ -8,12 +8,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from monai.data import DataLoader
 
 # Local imports
 from dataset import get_dataloaders
 from modules import UNet3D
-import helpers # Import helpers to access get_dice_metric
+from evaluation_functions import dice_coefficient # Import the custom Dice Coefficient metric
 
 # Config
 
@@ -28,42 +27,43 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     NUM_CLASSES = 6
     BATCH_SIZE = 1
-    NUM_WORKERS = 2
+    NUM_WORKERS = 1
     SPATIAL_SIZE = (256, 256, 128)
     
-    # Use the same configuration as training
-    INCLUDE_BACKGROUND = False
+    EXCLUDE_BACKGROUND = True
 
 
 # Visualization function
 def visualize_prediction(image, label, pred, save_path, idx, num_classes):
     """
     Save visualization of 3D prediction vs ground truth for one sample.
-    Assumes label and pred are one-hot (C, D, H, W) and converts them to index maps.
+    Assumes image is (B, 1, D, H, W) and label/pred are (B, D, H, W) sparse index maps.
     """
     os.makedirs(save_path, exist_ok=True)
     
     # Image: (B, 1, D, H, W) -> (D, H, W). Take the single channel and remove batch dim.
     image = image[0, 0].cpu().numpy() 
     
-    # Label/Pred: (B, C, D, H, W) -> (D, H, W) index map. Take the single channel for batch dim.
-    true_label = torch.argmax(label[0], dim=0).cpu().numpy() 
-    pred_label = torch.argmax(pred[0], dim=0).cpu().numpy()
+    # Label/Pred: (B, D, H, W) index map. Remove batch dim.
+    true_label = label[0].cpu().numpy()
+    pred_label = pred[0].cpu().numpy()
     
     # Choose a central slice for visualization
     mid_slice = image.shape[2] // 2
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    axes[0].imshow(image[:, :, mid_slice].transpose(), cmap='gray') # Transpose for better display order (H, W)
+    # Transpose for common viewing orientation (e.g., Axial slice)
+    slice_func = lambda arr: arr[:, :, mid_slice].transpose() 
+    
+    axes[0].imshow(slice_func(image), cmap='gray') 
     axes[0].set_title("Input MRI")
     
     # Use vmin/vmax to ensure consistent color mapping for all classes
-    # cmap='tab10' is good for discrete classes up to 10
-    axes[1].imshow(true_label[:, :, mid_slice].transpose(), cmap='tab10', vmin=0, vmax=num_classes - 1)
+    axes[1].imshow(slice_func(true_label), cmap='tab10', vmin=0, vmax=num_classes - 1)
     axes[1].set_title("Ground Truth")
     
-    axes[2].imshow(pred_label[:, :, mid_slice].transpose(), cmap='tab10', vmin=0, vmax=num_classes - 1)
+    axes[2].imshow(slice_func(pred_label), cmap='tab10', vmin=0, vmax=num_classes - 1)
     axes[2].set_title("Prediction")
     
     for ax in axes:
@@ -76,54 +76,62 @@ def visualize_prediction(image, label, pred, save_path, idx, num_classes):
 # Model evaluation
 def evaluate_model(model, test_loader, device):
     """
-    Evaluate model on test set and compute Dice scores using helpers.py.
+    Evaluate model on test set and compute Dice scores using evaluation_functions.py.
     """
-    # Use the consistent DiceMetric setup from helpers.py
-    dice_metric = helpers.get_dice_metric(
-        include_background=Config.INCLUDE_BACKGROUND,
-        reduction="none" # Keep reduction="none" to get class-wise scores
-    )
     
     model.eval()
+    all_dice_scores = [] # Store class-wise dice scores for all samples
     
     with torch.no_grad():
-        for idx, batch in enumerate(tqdm(test_loader, desc="Evaluating")):
-            images = batch['image'].to(device)
-            labels = batch['label'].to(device) # Labels are now assumed one-hot (B, C, D, H, W)
+        # Assumes DataLoader returns a tuple: (image_tensor, label_tensor)
+        for idx, (images, labels) in enumerate(tqdm(test_loader, desc="Evaluating")):
+            images = images.to(device)
+            labels = labels.to(device) # Labels are sparse index maps (B, D, H, W)
             
-            outputs = model(images)
-            outputs = torch.softmax(outputs, dim=1) # Predictions are (B, C, D, H, W) probabilities
+            outputs = model(images) # Outputs are logits (B, C, D, H, W)
+            
+            # 1. Compute Dice Score
+            # dice_coefficient returns (mean_dice_non_background, dice_per_class_non_background)
+            _, dice_per_class = dice_coefficient(
+                pred=outputs, 
+                target=labels, 
+                num_classes=Config.NUM_CLASSES
+            )
+            all_dice_scores.append(dice_per_class.cpu().numpy())
+            
+            # 2. Prepare prediction for visualization
+            # Convert logits to class index map (B, D, H, W)
+            pred_index_map = torch.argmax(outputs, dim=1) 
             
             # Save visualization for first few samples
             if idx < 5:
-                visualize_prediction(images, labels, outputs, Config.VIS_DIR, idx, Config.NUM_CLASSES)
-            
-            # Compute Dice per sample
-            dice_metric(y_pred=outputs, y=labels)
+                # The label tensor here is the sparse index map from the dataloader
+                visualize_prediction(images, labels, pred_index_map, Config.VIS_DIR, idx, Config.NUM_CLASSES)
     
     # Aggregate scores
-    # If include_background=False (Config default), this returns C-1 scores.
-    # We use reduction="none" to get the full array.
-    dice_per_class = dice_metric.aggregate(reduction="none").cpu().numpy()
-    dice_mean = dice_per_class.mean()
-    dice_metric.reset()
+    # all_dice_scores is a list of (1, C-1) arrays (one per sample)
+    all_dice_scores = np.concatenate(all_dice_scores, axis=0)
+    
+    # Calculate the mean score across all samples for each class
+    mean_dice_per_class = all_dice_scores.mean(axis=0) 
+    mean_dice = mean_dice_per_class.mean()
     
     # Output class labels start from 1 because background (class 0) is excluded
     class_labels = range(1, Config.NUM_CLASSES)
     
     print("\n--- Dice Scores (Excluding Background) ---")
-    for i, score in zip(class_labels, dice_per_class[0]): # dice_per_class is (1, C-1)
+    for i, score in zip(class_labels, mean_dice_per_class): 
         print(f"Class {i}: {score:.4f}")
-    print(f"Mean Dice (no background): {dice_mean:.4f}")
+    print(f"Overall Mean Dice (no background): {mean_dice:.4f}")
     
-    return dice_mean, dice_per_class[0]
+    return mean_dice, mean_dice_per_class
 
 # Main function
 
 def main():
     print("Loading data and model...")
     
-    # Load test set
+    # Load test set (from dataset.py)
     _, _, test_loader = get_dataloaders(
         mr_folder=Config.MR_FOLDER,
         label_folder=Config.LABEL_FOLDER,
@@ -133,9 +141,11 @@ def main():
         num_classes=Config.NUM_CLASSES,
     )
     
-    # Initialize model
+    # Initialize model (from modules.py)
     # Note: Using the same dropout_p=0.2 from your train.py configuration
     model = UNet3D(in_channels=1, out_channels=Config.NUM_CLASSES, dropout_p=0.2) 
+    
+    # Load checkpoint
     checkpoint = torch.load(Config.CHECKPOINT_PATH, map_location=Config.DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(Config.DEVICE)
@@ -148,7 +158,7 @@ def main():
     # Save summary
     os.makedirs(Config.VIS_DIR, exist_ok=True)
     with open(os.path.join(Config.VIS_DIR, "dice_scores.txt"), "w") as f:
-        f.write(f"Mean Dice (no background): {mean_dice:.4f}\n")
+        f.write(f"Overall Mean Dice (no background): {mean_dice:.4f}\n")
         
         # Save class-wise scores
         class_labels = range(1, Config.NUM_CLASSES)
