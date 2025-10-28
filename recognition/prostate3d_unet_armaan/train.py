@@ -1,187 +1,177 @@
+"""
+train.py - Training script for 3D U-Net using a combined Cross-Entropy and Dice Loss.
+This script is updated to use local pure PyTorch implementations.
+"""
+
 import os
 import torch
-import numpy as np
-from torch.utils.data import DataLoader
+import torch.nn as nn
 from torch import optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 # Local imports
-import dataset
-import modules
-from modules import UNet3D, dice_loss, dice_coefficient
-from dataset import Prostate3DDataset, get_paired_paths
+from dataset import get_dataloaders # Import data loading function
+from modules import UNet3D # Import the model architecture
+from evaluation_functions import DiceLoss, dice_coefficient # Import loss and metric
 
-# Logs and visualization directories
-LOG_FILE = "logs/dice_per_epoch.txt"
-VIS_DIR = "logs/visualizations"
-os.makedirs("logs", exist_ok=True)
-os.makedirs(VIS_DIR, exist_ok=True)
-with open(LOG_FILE, "w") as f:
-    f.write("epoch,train_loss,val_dice\n")
+# Config for compliance on Rangpur
+class Config:
+    BASE_DIR = "/home/groups/comp3710/HipMRI_Study_open"
+    MR_FOLDER = os.path.join(BASE_DIR, "semantic_MRs")
+    LABEL_FOLDER = os.path.join(BASE_DIR, "semantic_labels_only")
 
-# Config
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCHS = 20
-LR = 1e-4
-BATCH_SIZE = 1
-VISUALIZE_EVERY = 2
-NUM_CLASSES = 6
-TARGET_SHAPE = (256, 256, 128)
+    LOG_DIR = "logs"
+    CHECKPOINT_DIR = "checkpoints"
 
-# Data loading
-print("Loading dataset...")
-base_dir = "/home/groups/comp3710/HipMRI_Study_open"
-mr_folder = os.path.join(base_dir, "semantic_MRs")
-label_folder = os.path.join(base_dir, "semantic_labels_only")
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    EPOCHS = 50
+    LR = 1e-4
+    BATCH_SIZE = 2
+    NUM_WORKERS = 1
+    NUM_CLASSES = 6
 
-image_paths, label_paths = get_paired_paths(mr_folder, label_folder)
+    TRAIN_SPATIAL_SIZE = (96, 96, 48)
+    VAL_SPATIAL_SIZE = (256, 256, 128)
 
-# Split 80% train / 10% val / 10% test
-num_total = len(image_paths)
-train_end = int(0.8 * num_total)
-val_end = int(0.9 * num_total)
+    LOG_FILE = os.path.join(LOG_DIR, "training_log.txt")
 
-train_img, val_img, test_img = image_paths[:train_end], image_paths[train_end:val_end], image_paths[val_end:]
-train_lbl, val_lbl, test_lbl = label_paths[:train_end], label_paths[train_end:val_end], label_paths[val_end:]
+    WEIGHT_DECAY = 1e-5
+    LR_PATIENCE = 5
+    LR_FACTOR = 0.5
+    
+    # Loss weights for combination
+    DICE_WEIGHT = 0.5
+    CE_WEIGHT = 1.0
 
-train_dataset = Prostate3DDataset(train_img, train_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
-val_dataset = Prostate3DDataset(val_img, val_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
-test_dataset = Prostate3DDataset(test_img, test_lbl, num_classes=NUM_CLASSES, target_shape=TARGET_SHAPE)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+# Setup and logging
+def setup_directories():
+    os.makedirs(Config.LOG_DIR, exist_ok=True)
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
 
-print(f"Dataset ready: {len(train_dataset)} train, {len(val_dataset)} val, {len(test_dataset)} test samples")
+def setup_logging():
+    with open(Config.LOG_FILE, "w") as f:
+        f.write("epoch,train_loss,val_dice,learning_rate\n")
 
-# Model setup
-model = UNet3D(in_channels=1, out_channels=NUM_CLASSES, dropout_p=0.2).to(DEVICE)
-optimizer = optim.Adam(model.parameters(), lr=LR)
+def log_metrics(epoch, train_loss, val_dice, lr):
+    with open(Config.LOG_FILE, "a") as f:
+        f.write(f"{epoch},{train_loss:.6f},{val_dice:.6f},{lr:.8f}\n")
 
-print("Model initialized:", model.__class__.__name__)
+# Combined Loss function using pure PyTorch
+def combined_loss_fn(pred, target, criterion_ce, criterion_dice):
+    """Calculates the weighted sum of Cross-Entropy and Dice Loss."""
+    ce_loss = criterion_ce(pred, target.long())
+    dice_loss = criterion_dice(pred, target)
+    return Config.CE_WEIGHT * ce_loss + Config.DICE_WEIGHT * dice_loss
 
-# Visualization function (saves images instead of showing)
-def save_3d_predictions(model, dataset, save_dir, epoch=0, n=2, slice_idx=None, device='cpu', prefix="val"):
-    model.eval()
-    os.makedirs(save_dir, exist_ok=True)
-
-    with torch.no_grad():
-        for i in range(min(n, len(dataset))):
-            x, y = dataset[i]
-            x = x.unsqueeze(0).to(device)
-            pred = model(x).cpu()
-            pred_labels = torch.argmax(pred[0], dim=0)
-            true_labels = torch.argmax(y, dim=0)
-
-            if slice_idx is None:
-                slice_idx = pred_labels.shape[2] // 2
-
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-            axes[0].imshow(x[0, 0, :, :, slice_idx].cpu().numpy(), cmap='gray')
-            axes[0].set_title("Input MRI"); axes[0].axis("off")
-            axes[1].imshow(true_labels[:, :, slice_idx].numpy(), cmap="tab10")
-            axes[1].set_title("Ground Truth"); axes[1].axis("off")
-            axes[2].imshow(pred_labels[:, :, slice_idx].numpy(), cmap="tab10")
-            axes[2].set_title("Prediction"); axes[2].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, f"{prefix}_epoch{epoch}_sample{i}.png"))
-            plt.close(fig)
+# Training + validation loops
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch):
     model.train()
+    epoch_loss = 0.0
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
+    
+    # Assumes DataLoader returns a tuple: (image_tensor, label_tensor)
+    for images, labels in pbar: 
+        images = images.to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        
+        # Calculate loss using the combined criterion
+        loss = criterion(outputs, labels) 
+        
+        loss.backward()
+        optimizer.step()
 
-def plot_losses(losses, save_path="logs/losses.png"):
-    plt.figure(figsize=(6, 4))
-    plt.plot(losses, 'bo-', linewidth=2)
-    plt.title("Dice Loss Over Epochs", fontsize=14)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.grid(True, alpha=0.3)
-    plt.savefig(save_path)
-    plt.close()
+        epoch_loss += loss.item()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    return epoch_loss / len(train_loader)
 
-# Training loop
-def train_3d(model, train_loader, val_dataset, epochs=10, lr=1e-4, visualize_every=1, device='cpu'):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    losses = []
-    val_dices = []
-
-    print("Starting 3D U-Net training with Dice Loss...")
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0
-
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            preds = model(x)
-            loss = dice_loss(preds, y)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(train_loader)
-        losses.append(avg_loss)
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            dice_scores = []
-            for i in range(len(val_dataset)):
-                vx, vy = val_dataset[i]
-                vx = vx.unsqueeze(0).to(device)
-                preds = model(vx)
-                dice_val = dice_coefficient(preds, vy.unsqueeze(0).to(device))
-                dice_scores.append(dice_val.item())
-            mean_dice = np.mean(dice_scores)
-            val_dices.append(mean_dice)
-            print(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Val Dice={mean_dice:.4f}")
-
-            with open(LOG_FILE, "a") as f:
-                f.write(f"{epoch+1},{avg_loss:.4f},{mean_dice:.4f}\n")
-
-        if (epoch + 1) % visualize_every == 0:
-            save_3d_predictions(model, val_dataset, VIS_DIR, epoch+1, device=device, prefix="val")
-
-    print("Training complete!")
-    plot_losses(losses)
-
-    # Final average validation Dice
-    final_avg_dice = np.mean(val_dices)
-    print(f"\nFinal average validation Dice over {epochs} epochs: {final_avg_dice:.4f}")
-
-    return losses, val_dices
-
-# Test evaluation
-def evaluate_test(model, test_dataset, device='cpu'):
+def validate(model, val_loader, dice_metric_fn, device):
+    """
+    Validates model and computes mean Dice Score using the pure PyTorch function.
+    """
     model.eval()
-    dice_scores = []
-
+    total_dice = 0.0
     with torch.no_grad():
-        for i in range(len(test_dataset)):
-            x, y = test_dataset[i]
-            x = x.unsqueeze(0).to(device)
-            preds = model(x)
-            dice_val = dice_coefficient(preds, y.unsqueeze(0).to(device))
-            dice_scores.append(dice_val.item())
+        # Assumes DataLoader returns a tuple: (image_tensor, label_tensor)
+        for images, labels in tqdm(val_loader, desc="Validating", leave=False):
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            
+            # Use the pure PyTorch dice_coefficient function
+            mean_dice, _ = dice_metric_fn(outputs, labels, num_classes=Config.NUM_CLASSES)
+            total_dice += mean_dice.item()
+            
+    # Calculate the average Dice score over all batches
+    return total_dice / len(val_loader)
 
-    mean_test_dice = np.mean(dice_scores)
-    print(f"\nFinal Dice on test set: {mean_test_dice:.4f}")
 
-    # Save visualizations of test predictions
-    save_3d_predictions(model, test_dataset, VIS_DIR, epoch=0, device=device, prefix="test")
-    return mean_test_dice
+def train(model, train_loader, val_loader, combined_criterion, dice_metric_fn, optimizer, scheduler, device, epochs):
+    best_dice, best_epoch = -1.0, 0
 
-# Run training
+    for epoch in range(1, epochs + 1):
+        current_lr = optimizer.param_groups[0]['lr']
+        train_loss = train_one_epoch(model, train_loader, combined_criterion, optimizer, device, epoch)
+        
+        # Validate using the custom dice_coefficient function
+        val_dice = validate(model, val_loader, dice_metric_fn, device)
+        
+        scheduler.step(val_dice)
+
+        log_metrics(epoch, train_loss, val_dice, current_lr)
+        print(f"Epoch {epoch}: Train Loss={train_loss:.4f}, Val Dice={val_dice:.4f}, LR={current_lr:.6e}")
+
+        if val_dice > best_dice:
+            best_dice, best_epoch = val_dice, epoch
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_dice': val_dice,
+                'train_loss': train_loss
+            }, os.path.join(Config.CHECKPOINT_DIR, "best_model.pth"))
+            print(f"  ✓ New best model saved (Dice={val_dice:.4f})")
+
+    print(f"\nTraining complete. Best Dice={best_dice:.4f} (Epoch {best_epoch})")
+
+# Main
+def main():
+    setup_directories()
+    setup_logging()
+
+    # Get dataloaders from dataset.py
+    train_loader, val_loader, _ = get_dataloaders(
+        mr_folder=Config.MR_FOLDER,
+        label_folder=Config.LABEL_FOLDER,
+        batch_size=Config.BATCH_SIZE,
+        num_workers=Config.NUM_WORKERS,
+        train_spatial_size=Config.TRAIN_SPATIAL_SIZE,
+        val_spatial_size=Config.VAL_SPATIAL_SIZE,
+        num_classes=Config.NUM_CLASSES,
+    )
+
+    # UNet3D model from modules.py
+    model = UNet3D(in_channels=1, out_channels=Config.NUM_CLASSES).to(Config.DEVICE)
+
+    # Initialize pure PyTorch loss functions (nn.CrossEntropyLoss is standard PyTorch)
+    criterion_ce = nn.CrossEntropyLoss().to(Config.DEVICE) 
+    criterion_dice = DiceLoss(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
+    
+    # Define the combined criterion function for training
+    combined_criterion = lambda pred, target: combined_loss_fn(pred, target, criterion_ce, criterion_dice)
+    
+    # Get the Dice metric function from evaluation_functions.py
+    dice_metric_fn = dice_coefficient 
+
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=Config.LR_FACTOR, patience=Config.LR_PATIENCE)
+
+    print(f"Model, optimizer, and losses ready on {Config.DEVICE}")
+    train(model, train_loader, val_loader, combined_criterion, dice_metric_fn, optimizer, scheduler, Config.DEVICE, Config.EPOCHS)
+
 if __name__ == "__main__":
-    losses, val_dices = train_3d(model, train_loader, val_dataset,
-                                 epochs=EPOCHS, lr=LR,
-                                 visualize_every=VISUALIZE_EVERY,
-                                 device=DEVICE)
-
-    # Save model
-    os.makedirs("checkpoints", exist_ok=True)
-    torch.save(model.state_dict(), "checkpoints/unet3d_dice.pth")
-    print("Model saved to checkpoints/unet3d_dice.pth")
-
-    # Evaluate on test set
-    evaluate_test(model, test_dataset, device=DEVICE)
+    main()
