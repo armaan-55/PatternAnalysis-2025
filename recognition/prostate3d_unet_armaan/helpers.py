@@ -1,20 +1,10 @@
 import numpy as np
-from monai.transforms import (
-    Compose,
-    RandFlipd,
-    RandRotate90d,
-    NormalizeIntensityd,
-    RandCropByLabelClassesd,
-    Resized,
-    RandScaleIntensityd,
-    RandShiftIntensityd,
-    RandGaussianNoised,
-    ToTensord,
-    AsDiscreted
-)
-from monai.losses import DiceLoss, DiceCELoss
-from monai.metrics import DiceMetric
-import os
+import nibabel as nib
+from tqdm import tqdm
+from scipy.ndimage import zoom
+import torchio as tio
+import torch
+import random
 
 def to_channels(label_volume, num_classes=None, dtype=np.uint8):
     if num_classes is None:
@@ -25,124 +15,98 @@ def to_channels(label_volume, num_classes=None, dtype=np.uint8):
         out[..., c] = (label_volume == c).astype(dtype)
     return out
 
-def get_paired_paths(mr_folder, label_folder):
+def applyOrientation(nifti_img, interpolation='linear', scale=1):
+    """Reorient a NiFTI image to the closest canonical orientation."""
+    reoriented_img = nib.as_closest_canonical(nifti_img)
+    return reoriented_img
+
+def resize_image(image_data, original_affine, target_shape, interpolation_order=1):
+    """Resizes a 3D image to the target shape using zoom interpolation."""
+    current_shape = image_data.shape
+    if current_shape == target_shape:
+        return image_data
+    scale_factors = [n / o for n, o in zip(target_shape, current_shape)]
+    return zoom(image_data, scale_factors, order=interpolation_order)
+
+class ImageProcessor:
     """
-    Pair MR images and labels by patient ID.
-    Returns list of dictionaries for MONAI compatibility.
+    Handles all pre-processing and on-the-fly augmentation for a single 
+    image/label pair using Torchio.
     """
-    mr_files = sorted([f for f in os.listdir(mr_folder) if f.endswith(".nii.gz")])
-    label_files = sorted([f for f in os.listdir(label_folder) if f.endswith(".nii.gz")])
+    def __init__(self, target_shape=(128, 128, 128)):
+        self.target_shape = target_shape
+        self.preprocessing = tio.Compose([
+            tio.ToCanonical(),
+            tio.Resize(target_shape),
+        ])
 
-    data_dicts = []
-
-    for label_file in label_files:
-        patient_id = label_file.split('_')[0]
-        mr_match = [f for f in mr_files if f.startswith(patient_id)]
-        if mr_match:
-            data_dicts.append({
-                'image': os.path.join(mr_folder, mr_match[0]),
-                'label': os.path.join(label_folder, label_file)
-            })
-
-    if len(data_dicts) == 0:
-        raise ValueError("No matching files found between MR and label folders!")
-
-    print(f"Found {len(data_dicts)} matching pairs")
-    return data_dicts
-
-# Handle MONAI transforms
-def get_train_transforms_monai(spatial_size=(96, 96, 48), num_classes=6):
-    """
-    Training transforms using MONAI.
-    Patch-based training with augmentation.
-    """
-    return Compose([
-        # Spatial augmentation
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-        RandRotate90d(keys=["image", "label"], prob=0.3, spatial_axes=(0, 1)),
-        
-        # Intensity augmentation (only on image)
-        RandScaleIntensityd(keys="image", factors=0.1, prob=0.3),
-        RandShiftIntensityd(keys="image", offsets=0.1, prob=0.3),
-        RandGaussianNoised(keys="image", prob=0.2, mean=0.0, std=0.1),
-        
-        # Normalize
-        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-        
-        # Smart cropping - KEY TRANSFORM!
-        RandCropByLabelClassesd(
-            keys=["image", "label"],
-            label_key="label",
-            spatial_size=spatial_size,
-            num_classes=num_classes,
-            num_samples=1,
-        ),
-        
-        AsDiscreted(keys="label", to_onehot=num_classes),
-        # Convert to tensors with channel dimension
-        ToTensord(keys=["image", "label"]),
-    ])
-
-
-def get_val_transforms_monai(spatial_size=(256, 256, 128), num_classes=6):
-    """
-    Validation/test transforms - no augmentation.
-    """
-    return Compose([
-        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-        Resized(
-            keys=["image", "label"], 
-            spatial_size=spatial_size, 
-            mode=["trilinear", "nearest"]
-        ),
-        AsDiscreted(keys="label", to_onehot=num_classes),
-        ToTensord(keys=["image", "label"]),
-    ])
-
-def get_dice_loss(include_background=False, softmax=True):
-    """
-    Get MONAI's Dice Loss.
+        # Random transformations for use on training data
+        self.augment_transforms = tio.Compose([
+            tio.RandomFlip(axes=(0, 1, 2), flip_probability=0.5),
+            
+            # Affine/Rotation (Geometric distortion)
+            tio.RandomAffine(
+                scales=(0.9, 1.1),
+                degrees=10,
+                translation=5,
+                isotropic=True,
+                p=0.5,
+            ),
+            
+            # Elastic Deformation (Non-linear deformation)
+            tio.RandomElasticDeformation(
+                num_control_points=5,
+                max_displacement=7.5,
+                p=0.25,
+            )
+        ])
     
-    Args:
-        include_background: If False, ignore background class (class 0)
-        to_onehot_y: If True, convert target to one-hot (use False if already one-hot)
-        softmax: If True, apply softmax to predictions (use False if model outputs softmax)
-    
-    Returns:
-        DiceLoss instance
-    """
-    return DiceLoss(
-        include_background=include_background,
-        softmax=softmax,
-        squared_pred=False,  # Use standard Dice formula
-        reduction="mean",
-    )
+    @staticmethod
+    def load_nifti(image_path, dtype=np.float32):
+        """Load Nifti file and return data array and affine."""
+        nifti_image = nib.load(image_path)
+        image_data = nifti_image.get_fdata().astype(dtype)
+        if len(image_data.shape) == 4:
+            image_data = image_data[..., 0]
+        return image_data, nifti_image.affine
 
+    def process_pair(self, mri_path, label_path, is_augmenting=True):
+        """
+        Loads, preprocesses, and augments a single image/label pair.
+        Returns a (C, D, H, W) image tensor and a (D, H, W) label tensor.
+        """
+        # Load data
+        mri_data, mri_affine = self.simple_load_nifti(mri_path, dtype=np.float32)
+        label_data, label_affine = self.simple_load_nifti(label_path, dtype=np.uint8)
 
-def get_dice_ce_loss(include_background=False, softmax=True, lambda_dice=1.0, lambda_ce=1.0):
-    """
-    Get combined Dice + Cross Entropy Loss (often works better!).
-    
-    This is what many top medical segmentation models use.
-    Dice helps with class imbalance, CE helps with harder examples.
-    
-    Args:
-        lambda_dice: Weight for Dice loss
-        lambda_ce: Weight for Cross Entropy loss
-    """
-    return DiceCELoss(
-        include_background=include_background,
-        softmax=softmax,
-        lambda_dice=lambda_dice,
-        lambda_ce=lambda_ce,
-    )
+        # Create Torchio Subject
+        mri_tensor = torch.tensor(mri_data).unsqueeze(0)
+        label_tensor = torch.tensor(label_data).unsqueeze(0)
+        
+        # Use appropriate tio classes for interpolation
+        mri_subject = tio.ScalarImage(tensor=mri_tensor, affine=mri_affine)
+        label_subject = tio.LabelMap(tensor=label_tensor, affine=label_affine)
+        subject = tio.Subject(image=mri_subject, label=label_subject)
 
+        # Apply FIXED Preprocessing (Orientation, Resizing)
+        subject = self.preprocessing(subject)
+        
+        # Apply RANDOM Augmentation
+        if is_augmenting:
+            # Torchio applies spatial transforms (flip, rotation) to both
+            subject = self.augment_transforms(subject)
+            # Intensity transforms are only applied to the image (ScalarImage)
+            subject['image'] = self.random_intensity_transforms()(subject['image'])
 
-def get_dice_metric(include_background=False, reduction="mean", get_not_nans=False):
-    return DiceMetric(
-        include_background=include_background,
-        reduction=reduction,
-        get_not_nans=get_not_nans,
-    )
+        # Final Normalization and Tensor Conversion
+        mri_data_out = subject['image'].data.squeeze().numpy()
+        label_data_out = subject['label'].data.squeeze().numpy()
+        
+        # Z-score normalization
+        mri_data_out = (mri_data_out - np.mean(mri_data_out)) / (np.std(mri_data_out) + 1e-8)
+        
+        # Final PyTorch Tensor format: (C, D, H, W) for image, (D, H, W) for label
+        mri_tensor_out = torch.tensor(mri_data_out, dtype=torch.float32).unsqueeze(0)
+        label_tensor_out = torch.tensor(label_data_out, dtype=torch.long) 
+        
+        return mri_tensor_out, label_tensor_out
