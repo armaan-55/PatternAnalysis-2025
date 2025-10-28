@@ -76,8 +76,8 @@ class ImageProcessor:
         Returns a (C, D, H, W) image tensor and a (D, H, W) label tensor.
         """
         # Load data
-        mri_data, mri_affine = self.simple_load_nifti(mri_path, dtype=np.float32)
-        label_data, label_affine = self.simple_load_nifti(label_path, dtype=np.uint8)
+        mri_data, mri_affine = self.load_nifti(mri_path, dtype=np.float32)
+        label_data, label_affine = self.load_nifti(label_path, dtype=np.uint8)
 
         # Create Torchio Subject
         mri_tensor = torch.tensor(mri_data).unsqueeze(0)
