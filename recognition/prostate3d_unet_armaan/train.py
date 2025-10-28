@@ -17,14 +17,20 @@ from evaluation_functions import DiceLoss, dice_coefficient # Import loss and me
 
 # Config for compliance on Rangpur
 class Config:
-    BASE_DIR = "/home/groups/comp3710/HipMRI_Study_open"
+    BASE_DIR = "recognition/Prostate3D_local"
     MR_FOLDER = os.path.join(BASE_DIR, "semantic_MRs")
     LABEL_FOLDER = os.path.join(BASE_DIR, "semantic_labels_only")
 
     LOG_DIR = "logs"
     CHECKPOINT_DIR = "checkpoints"
 
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.mps.is_available():
+        DEVICE = "mps"
+    elif torch.cuda.is_available():
+        DEVICE = "cuda"
+    else:
+        DEVICE = "cpu"
+
     EPOCHS = 50
     LR = 1e-3
     BATCH_SIZE = 2
