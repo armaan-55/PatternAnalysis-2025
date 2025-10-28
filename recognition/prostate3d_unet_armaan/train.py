@@ -26,7 +26,7 @@ class Config:
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     EPOCHS = 50
-    LR = 1e-4
+    LR = 1e-3
     BATCH_SIZE = 2
     NUM_WORKERS = 1
     NUM_CLASSES = 6
