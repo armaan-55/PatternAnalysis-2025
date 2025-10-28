@@ -2,72 +2,123 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class UNet3D(nn.Module):
-    """3D UNet for HipMRI Prostate image slices with Dice evaluation"""
+# 3D Unet model now following architecture described by Jiangtao et al. from https://arxiv.org/pdf/2502.06895
 
-    def __init__(self, in_channels=1, out_channels=6, dropout_p=0.2):
+# Decoder block
+class DecoderBlock(nn.Module):
+    """
+    Decoder block with upsampling and convolution.
+    Pads input feature maps to match encoder size before concatenation.
+    """
+    def __init__(self, in_channels, skip_channels, out_channels, use_batchnorm=True):
         super().__init__()
+        self.up = nn.ConvTranspose3d(in_channels, out_channels, kernel_size=2, stride=2)
+        
+        layers = [
+            nn.Conv3d(skip_channels + out_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        ]
+        if use_batchnorm:
+            layers.append(nn.BatchNorm3d(out_channels))
+        self.conv = nn.Sequential(*layers)
 
-        # Encoder (downsampling)
-        self.enc1 = self._conv_block(in_channels, 32, dropout_p)
-        self.enc2 = self._conv_block(32, 64, dropout_p)
-        self.enc3 = self._conv_block(64, 128, dropout_p)
+    def forward(self, x, skip):
+        x = self.up(x)
+        # Compute size difference for padding
+        diffZ = skip.size(2) - x.size(2)
+        diffY = skip.size(3) - x.size(3)
+        diffX = skip.size(4) - x.size(4)
+        x = F.pad(x, [diffX // 2, diffX - diffX // 2,
+                      diffY // 2, diffY - diffY // 2,
+                      diffZ // 2, diffZ - diffZ // 2])
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-        # Decoder (upsampling)
-        self.dec3 = self._conv_block(128 + 64, 64, dropout_p)
-        self.dec2 = self._conv_block(64 + 32, 32, dropout_p)
-        self.final_conv = nn.Conv3d(32, out_channels, 1)
-
-        self.pool = nn.MaxPool3d(2)
-        self.upsample = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-
-    def _conv_block(self, in_ch, out_ch, dropout_p=0.2):
-        return nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm3d(out_ch),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            nn.Dropout3d(dropout_p),
-            nn.Conv3d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm3d(out_ch),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            nn.Dropout3d(dropout_p)
+# 3D Unet model
+class UNet3D(nn.Module):
+    """
+    5-Level 3D U-Net with architecture as per source 
+    """
+    def __init__(self, in_channels=1, out_channels=6, dropout_p=0.0):
+        super().__init__()
+        BASE = 8 
+                
+        # Conv3D Block 1: in_channels (e.g., 1) -> 8 (Skip: e1)
+        self.enc1 = nn.Sequential(
+            nn.Conv3d(in_channels, BASE, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv3d(BASE, BASE, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.BatchNorm3d(BASE),
         )
+        self.pool1 = nn.MaxPool3d(2) 
+
+        # Conv3D Block 2: 8 -> 16 (Skip: e2)
+        self.enc2 = nn.Sequential(
+            nn.Conv3d(BASE, BASE*2, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv3d(BASE*2, BASE*2, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.BatchNorm3d(BASE*2),
+        )
+        self.pool2 = nn.MaxPool3d(2) 
+
+        # Conv3D Block 3: 16 -> 32 (Skip: e3)
+        self.enc3 = nn.Sequential(
+            nn.Conv3d(BASE*2, BASE*4, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv3d(BASE*4, BASE*4, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.BatchNorm3d(BASE*4),
+        )
+        self.pool3 = nn.MaxPool3d(2) 
+
+        # Conv3D Block 4: 32 -> 64 (Skip: e4)
+        self.enc4 = nn.Sequential(
+            nn.Conv3d(BASE*4, BASE*8, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv3d(BASE*8, BASE*8, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.BatchNorm3d(BASE*8),
+        )
+        self.pool4 = nn.MaxPool3d(2) 
+
+        # --- BOTTLENECK (64 -> 128) ---
+        self.bottleneck = nn.Sequential(
+            nn.Conv3d(BASE*8, BASE*16, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv3d(BASE*16, BASE*16, kernel_size=3, padding=1), nn.ReLU(inplace=True),
+            nn.BatchNorm3d(BASE*16),
+            nn.Dropout3d(dropout_p) if dropout_p > 0 else nn.Identity()
+        )
+
+        # --- DECODER (Upsampling Path) ---
+        
+        # UpSampling Block 1: 128 + 64 -> 64
+        self.dec4 = DecoderBlock(BASE*16, BASE*8, BASE*8) 
+        
+        # UpSampling Block 2: 64 + 32 -> 32
+        self.dec3 = DecoderBlock(BASE*8, BASE*4, BASE*4)   
+        
+        # UpSampling Block 3: 32 + 16 -> 16
+        self.dec2 = DecoderBlock(BASE*4, BASE*2, BASE*2)   
+        
+        # UpSampling Block 4: 16 + 8 -> 8
+        self.dec1 = DecoderBlock(BASE*2, BASE, BASE)       
+
+        # Final convolution: 8 -> out_channels (e.g., 6)
+        self.out_conv = nn.Conv3d(BASE, out_channels, kernel_size=1)
 
     def forward(self, x):
         # Encoder
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
+        e1 = self.enc1(x)                   
+        p1 = self.pool1(e1)                 
+        e2 = self.enc2(p1)                  
+        p2 = self.pool2(e2)                 
+        e3 = self.enc3(p2)                  
+        p3 = self.pool3(e3)                 
+        e4 = self.enc4(p3)                  
+        p4 = self.pool4(e4)                 
 
-        # Decoder with skip connections
-        d3 = self.dec3(torch.cat([self.upsample(e3), e2], 1))
-        d2 = self.dec2(torch.cat([self.upsample(d3), e1], 1))
-        out = self.final_conv(d2)
-        out = torch.softmax(out, dim=1)
+        # Bottleneck
+        b = self.bottleneck(p4)             
+
+        # Decoder
+        d4 = self.dec4(b, e4)              
+        d3 = self.dec3(d4, e3)              
+        d2 = self.dec2(d3, e2)             
+        d1 = self.dec1(d2, e1)              
+
+        out = self.out_conv(d1)            
         return out
-    
-def dice_coefficient(pred, target, epsilon=1e-6):
-    """Compute mean Dice similarity coefficient per batch."""
-    pred = torch.argmax(pred, dim=1)  # [B, H, W, D]
-    target = torch.argmax(target, dim=1)  # assuming one-hot target
-
-    dice = 0
-    for c in range(pred.max() + 1):
-        pred_c = (pred == c).float()
-        target_c = (target == c).float()
-        intersection = (pred_c * target_c).sum()
-        union = pred_c.sum() + target_c.sum()
-        dice += (2 * intersection + epsilon) / (union + epsilon)
-    return dice / (pred.max() + 1)
-
-
-def dice_loss(pred, target, epsilon=1e-6):
-    """Differentiable dice loss for multi-class segmentation."""
-    pred = F.softmax(pred, dim=1)
-    target = target.float()
-
-    intersection = torch.sum(pred * target, dim=(2, 3, 4))
-    union = torch.sum(pred + target, dim=(2, 3, 4))
-    dice_score = (2. * intersection + epsilon) / (union + epsilon)
-    loss = 1 - dice_score.mean()
-    return loss
