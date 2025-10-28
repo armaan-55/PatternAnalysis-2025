@@ -6,108 +6,76 @@ import numpy as np
 # A small constant added to the numerator and denominator to prevent division by zero
 SMOOTH = 1e-5
 
-def dice_coefficient(pred, target, num_classes, smooth=SMOOTH):
-    """
-    Calculates the generalized Dice Similarity Coefficient (DSC) for multi-class segmentation.
-    
-    Args:
-        pred (torch.Tensor): Predicted logits (raw scores) from the model (N, C, D, H, W).
-        target (torch.Tensor): Ground truth labels (N, D, H, W). Expects sparse labels (0 to C-1).
-        num_classes (int): Number of segmentation classes (C).
-        smooth (float): Smoothing factor to prevent division by zero.
-
-    Returns:
-        torch.Tensor: The mean Dice Coefficient across all classes (excluding background if class_weights are used).
-    """
-    
-    # 1. Convert logits to probabilities using Softmax
-    # Shape changes from (N, C, D, H, W) to (N, C, D, H, W) where C is probability
-    pred = F.softmax(pred, dim=1) 
-    
-    # 2. Convert sparse target labels to one-hot encoding for comparison
-    # target shape (N, D, H, W) -> one_hot_target shape (N, C, D, H, W)
-    one_hot_target = F.one_hot(target.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
-    
-    # Flatten spatial dimensions (D*H*W) for easier calculation (N, C, V) where V = D*H*W
-    pred = pred.view(-1, num_classes, pred.size(2) * pred.size(3) * pred.size(4))
-    one_hot_target = one_hot_target.view(-1, num_classes, one_hot_target.size(2) * one_hot_target.size(3) * one_hot_target.size(4))
-
-    # Calculate Intersection and Union for all classes simultaneously
-    # Intersection: sum(p_c * t_c) over all spatial elements for each class c
-    intersection = torch.sum(pred * one_hot_target, dim=2)  # Shape (N, C)
-    
-    # Union (Denominator): sum(p_c + t_c) over all spatial elements for each class c
-    union = torch.sum(pred + one_hot_target, dim=2) # Shape (N, C)
-
-    # Calculate Dice Score per class (N, C)
-    # The original formula is 2 * I / U
-    dice_per_class = (2. * intersection + smooth) / (union + smooth) 
-    
-    # Typically, we ignore the background (class 0) for the final metric reporting.
-    # We take the mean across classes 1 to C-1.
-    # Note: If you want to include the background, use dice_per_class.mean()
-    
-    # Average the dice scores across the batch and the non-background classes
-    mean_dice = dice_per_class[:, 1:].mean()
-
-    return mean_dice
-
 class DiceLoss(nn.Module):
     """
-    The generalized multi-class Dice Loss (1 - Dice Coefficient).
-    Designed to be used with the CrossEntropy loss for robust training (e.g., BCE/CE + Dice).
+    A pure PyTorch implementation of the Dice Loss for multi-class segmentation.
+    Excludes the background (class 0) from the loss calculation.
     """
-    def __init__(self, num_classes, smooth=SMOOTH, weights=None):
-        super().__init__()
+    def __init__(self, num_classes, smooth=1e-5):
+        super(DiceLoss, self).__init__()
         self.num_classes = num_classes
         self.smooth = smooth
-        # Optional: class weights can be used to mitigate class imbalance
-        self.weights = weights if weights is not None else torch.ones(num_classes)
 
     def forward(self, pred, target):
-        """
-        Args:
-            pred (torch.Tensor): Predicted logits (raw scores) from the model (N, C, D, H, W).
-            target (torch.Tensor): Ground truth labels (N, D, H, W). Expects sparse labels (0 to C-1).
-        
-        Returns:
-            torch.Tensor: The weighted Dice Loss value.
-        """
-        
-        # 1. Softmax to get probabilities
-        # Shape: (N, C, D, H, W)
+        # pred: (B, C, D, H, W) logits -> apply softmax
+        # target: (B, D, H, W) sparse indices (long)
+
         pred = F.softmax(pred, dim=1)
-        
-        # 2. One-hot encode the target
-        # Target (N, D, H, W) -> One-Hot (N, C, D, H, W)
-        one_hot_target = F.one_hot(target.long(), num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
-        
-        # Ensure weights are on the correct device
-        if self.weights.device != pred.device:
-            self.weights = self.weights.to(pred.device)
 
-        # Flatten spatial dimensions
-        pred_flat = pred.view(-1, self.num_classes)        # (N*V, C)
-        target_flat = one_hot_target.view(-1, self.num_classes) # (N*V, C)
-        
-        # Apply class weights:
-        # We compute the weighted sum over all spatial dimensions (V = D*H*W)
-        
-        # Intersection: (p_c * t_c) over V dimensions -> (N, C)
-        intersection = torch.sum(pred * one_hot_target, dim=[2, 3, 4]) 
+        # Convert target to one-hot encoding (B, D, H, W) -> (B, D, H, W, C) -> (B, C, D, H, W)
+        target_oh = F.one_hot(target, num_classes=self.num_classes).permute(0, 4, 1, 2, 3).float()
 
-        # Sum of elements: (p_c + t_c) over V dimensions -> (N, C)
-        union = torch.sum(pred + one_hot_target, dim=[2, 3, 4]) 
+        # Reshape for easy calculation across all classes/batches (B*C, D*H*W)
+        pred_flat = pred.reshape(-1, pred.shape[-3] * pred.shape[-2] * pred.shape[-1])
+        target_flat = target_oh.reshape(-1, target_oh.shape[-3] * target_oh.shape[-2] * target_oh.shape[-1])
 
-        # Dice Score per class (N, C)
-        dice_per_class = (2. * intersection + self.smooth) / (union + self.smooth)
-        
-        # Weighted mean Dice across all N batches
-        # We weight the dice score for each class and then average across the batch.
-        # This implementation sums the weighted dice scores across all N*C entries and normalizes by N*C.
-        weighted_dice = (dice_per_class * self.weights.view(1, -1)).sum(dim=1) / self.weights.sum() 
-        
-        # Total Dice Loss is 1 - the weighted Dice score, averaged over the batch
-        dice_loss = 1. - weighted_dice.mean()
+        # Calculate intersection and union
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
 
-        return dice_loss
+        # Calculate Dice score (DSC) per class/sample pair
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+
+        # Reshape back to (Batch, Class)
+        dice_per_class_flat = dice.reshape(target.shape[0], self.num_classes)
+
+        # Exclude background (class 0)
+        dice_per_class = dice_per_class_flat[:, 1:]
+
+        # Mean Dice Loss across all non-background classes and all batch samples
+        mean_dice = dice_per_class.mean()
+        loss = 1.0 - mean_dice
+
+        return loss
+
+def dice_coefficient(pred, target, num_classes, smooth=1e-5):
+    """
+    Calculates the mean Dice coefficient and per-class Dice scores
+    (excluding background, class 0).
+    """
+    pred = F.softmax(pred, dim=1)
+
+    # Convert target to one-hot encoding
+    target_oh = F.one_hot(target, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+
+    # Reshape for easy calculation (B*C, D*H*W)
+    pred_flat = pred.reshape(-1, pred.shape[-3] * pred.shape[-2] * pred.shape[-1])
+    target_flat = target_oh.reshape(-1, target_oh.shape[-3] * target_oh.shape[-2] * target_oh.shape[-1])
+
+    # Calculate intersection and union
+    intersection = (pred_flat * target_flat).sum(dim=1)
+    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+
+    # Calculate Dice score (DSC) per class/sample pair
+    dice = (2. * intersection + smooth) / (union + smooth)
+
+    # Reshape back to (Batch, Class)
+    dice_per_class_flat = dice.reshape(target.shape[0], num_classes)
+
+    # Exclude background (class 0) for metric calculation
+    dice_per_class_non_bg = dice_per_class_flat[:, 1:]
+
+    # Calculate the mean Dice across all non-background classes and all batch samples
+    mean_dice_non_bg = dice_per_class_non_bg.mean()
+
+    return mean_dice_non_bg, dice_per_class_non_bg
