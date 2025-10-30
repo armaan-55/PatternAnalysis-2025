@@ -1,8 +1,16 @@
 """
-predict.py - Evaluate trained 3D U-Net on the Prostate 3D test set.
-Computes Dice metrics and saves visualization comparisons using pure PyTorch functions.
+predict.py - 3D U-Net Evaluation Methods
+
+A script to evaluate the final trained 3D U-Net model on the Prostate 3D test set.
+It computes class-wise Dice metrics (including background) and saves 
+visualization comparisons of the ground truth versus the model's prediction 
+for initial samples.
+
+Author: Armaan Aulakh
+Date: October 30 2025
 """
 
+# Package imports
 import os
 import torch
 import numpy as np
@@ -12,32 +20,61 @@ from tqdm import tqdm
 # Local imports
 from dataset import get_dataloaders
 from modules import UNet3D
-from evaluation_functions import dice_coefficient # Import the custom Dice Coefficient metric
 
 # Config
-
 class Config:
-    BASE_DIR = "/home/groups/comp3710/HipMRI_Study_open"
+    """
+    Class handling environmental configuration to run predict.py - dynamically sets path names
+    and controls backend infrastructure based on training device.
+    """
+
+    # Select device based on which backend is available for torch
+    if torch.mps.is_available():
+        DEVICE = "mps"
+    elif torch.cuda.is_available():
+        DEVICE = "cuda"
+    else:
+        DEVICE = "cpu"
+
+    # Dynamically select path to images based on backend architecture
+    if torch.mps.is_available():
+        BASE_DIR = "recognition/Prostate3D_local"
+    else:
+        BASE_DIR = "/home/groups/comp3710/HipMRI_Study_open"
+    
+    # Set environmental variables
     MR_FOLDER = os.path.join(BASE_DIR, "semantic_MRs")
     LABEL_FOLDER = os.path.join(BASE_DIR, "semantic_labels_only")
     
     CHECKPOINT_PATH = "checkpoints/best_model.pth"
     VIS_DIR = "logs/predictions"
     
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     NUM_CLASSES = 6
     BATCH_SIZE = 1
     NUM_WORKERS = 1
-    SPATIAL_SIZE = (256, 256, 128)
+    SPATIAL_SIZE = (192, 192, 96)
     
-    EXCLUDE_BACKGROUND = True
+    EXCLUDE_BACKGROUND = False
 
 
 # Visualization function
-def visualize_prediction(image, label, pred, save_path, idx, num_classes):
+def visualize_prediction(image, label, pred, save_path, idx, num_classes) -> None:
     """
-    Save visualization of 3D prediction vs ground truth for one sample.
-    Assumes image is (B, 1, D, H, W) and label/pred are (B, D, H, W) sparse index maps.
+    Generates and saves a three-panel comparison plot (Input, Ground Truth, Prediction).
+
+    The plot visualizes a central axial slice of a 3D volume, ensuring a consistent 
+    color map for all segmentation classes (0 to 5).
+
+    Args:
+        image (torch.Tensor): The input MRI volume (B, 1, D, H, W).
+        label (torch.Tensor): The ground truth sparse index map (B, D, H, W).
+        pred (torch.Tensor): The predicted class index map (B, D, H, W).
+        save_path (str): Directory where the output PNG file will be saved.
+        idx (int): The sample index, used for naming the output file.
+        num_classes (int): The total number of classes (6).
+    
+    Returns:
+        None: The function saves the figure to disk and closes the plot.
     """
     os.makedirs(save_path, exist_ok=True)
     
@@ -51,9 +88,9 @@ def visualize_prediction(image, label, pred, save_path, idx, num_classes):
     # Choose a central slice for visualization
     mid_slice = image.shape[2] // 2
     
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6))
     
-    # Transpose for common viewing orientation (e.g., Axial slice)
+    # Transpose for common viewing orientation
     slice_func = lambda arr: arr[:, :, mid_slice].transpose() 
     
     axes[0].imshow(slice_func(image), cmap='gray') 
@@ -68,68 +105,100 @@ def visualize_prediction(image, label, pred, save_path, idx, num_classes):
     
     for ax in axes:
         ax.axis("off")
-    
+
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, f"sample_{idx:03d}.png"), dpi=150)
     plt.close(fig)
 
 # Model evaluation
-def evaluate_model(model, test_loader, device):
+def evaluate_model(model, test_loader, device) -> tuple:
     """
-    Evaluate model on test set and compute Dice scores using evaluation_functions.py.
+    Evaluates the model and computes class-wise Dice Similarity Coefficients.
+
+    The function iterates through the test set, computes Dice scores for 
+    all classes (including background), and saves visualization images 
+    for the first five samples.
+
+    Args:
+        model (nn.Module): The loaded 3D U-Net model.
+        test_loader (DataLoader): The PyTorch DataLoader for the test set.
+        device (str): The execution device ('cuda', 'mps', or 'cpu').
+
+    Returns:
+        tuple: (mean_dice_all, mean_dice_per_class)
+            - mean_dice_all (float): The overall mean DSC across all classes and samples.
+            - mean_dice_per_class (np.ndarray): The mean DSC for each class (C,).
     """
-    
     model.eval()
-    all_dice_scores = [] # Store class-wise dice scores for all samples
+    all_dice_scores = [] # Store all C class-wise dice scores for all samples
     
     with torch.no_grad():
-        # Assumes DataLoader returns a tuple: (image_tensor, label_tensor)
         for idx, (images, labels) in enumerate(tqdm(test_loader, desc="Evaluating")):
             images = images.to(device)
-            labels = labels.to(device) # Labels are sparse index maps (B, D, H, W)
+            labels = labels.to(device)
             
             outputs = model(images) # Outputs are logits (B, C, D, H, W)
             
-            # 1. Compute Dice Score
-            # dice_coefficient returns (mean_dice_non_background, dice_per_class_non_background)
-            _, dice_per_class = dice_coefficient(
-                pred=outputs, 
-                target=labels, 
-                num_classes=Config.NUM_CLASSES
-            )
+            # Compute dice score for all classes (include background)
+            # NOTE: This section calculates the full (B, C) dice_per_class tensor, 
+            # including background (class 0), by re-implementing logic 
+            # from dice_coefficient. Training occurred with ommission of class 0 (BG)
+            # based on common practice researched for medical segmentation tasks.
+            
+            pred = torch.nn.functional.softmax(outputs, dim=1)
+            # Convert target to one-hot encoding (B, D, H, W) -> (B, C, D, H, W)
+            target_oh = torch.nn.functional.one_hot(labels, num_classes=Config.NUM_CLASSES).permute(0, 4, 1, 2, 3).float()
+            
+            dice_scores_list = []
+            smooth = 1e-5 # Ensure no potential division by 0
+            
+            for c in range(Config.NUM_CLASSES): # Iterate over ALL classes 0 to 5
+                pred_c = pred[:, c, ...].reshape(pred.shape[0], -1)
+                target_c = target_oh[:, c, ...].reshape(labels.shape[0], -1)
+                
+                intersection = (pred_c * target_c).sum(dim=1)
+                union = pred_c.sum(dim=1) + target_c.sum(dim=1)
+                
+                dice_c = (2. * intersection + smooth) / (union + smooth)
+                dice_scores_list.append(dice_c)
+            
+            # dice_per_class is (B, C) -> includes all classes 0 to 5
+            dice_per_class = torch.stack(dice_scores_list, dim=1) 
+            
+            # Store the scores for all classes
             all_dice_scores.append(dice_per_class.cpu().numpy())
             
-            # 2. Prepare prediction for visualization
-            # Convert logits to class index map (B, D, H, W)
+            # Prepare prediction for visualization
             pred_index_map = torch.argmax(outputs, dim=1) 
             
             # Save visualization for first few samples
             if idx < 5:
-                # The label tensor here is the sparse index map from the dataloader
+                # Visualization function remains the same and already uses all classes
                 visualize_prediction(images, labels, pred_index_map, Config.VIS_DIR, idx, Config.NUM_CLASSES)
     
     # Aggregate scores
-    # all_dice_scores is a list of (1, C-1) arrays (one per sample)
-    all_dice_scores = np.concatenate(all_dice_scores, axis=0)
+    # all_dice_scores is a list of (1, 6) arrays (one per sample)
+    all_dice_scores = np.concatenate(all_dice_scores, axis=0) # Shape: (Num_Samples, C)
     
     # Calculate the mean score across all samples for each class
-    mean_dice_per_class = all_dice_scores.mean(axis=0) 
-    mean_dice = mean_dice_per_class.mean()
+    mean_dice_per_class = all_dice_scores.mean(axis=0) # Shape: (6,)
+    mean_dice_all = mean_dice_per_class.mean()
     
-    # Output class labels start from 1 because background (class 0) is excluded
-    class_labels = range(1, Config.NUM_CLASSES)
+    # Output class labels start from 0 because background (class 0) is included
+    class_labels = range(Config.NUM_CLASSES)
     
-    print("\n--- Dice Scores (Excluding Background) ---")
+    print("\nDice Scores (Including Background)")
     for i, score in zip(class_labels, mean_dice_per_class): 
         print(f"Class {i}: {score:.4f}")
-    print(f"Overall Mean Dice (no background): {mean_dice:.4f}")
+    print(f"Overall Mean Dice: {mean_dice_all:.4f}")
     
-    return mean_dice, mean_dice_per_class
+    # Returning all scores now
+    return mean_dice_all, mean_dice_per_class
 
 # Main function
 
 def main():
-    print("Loading data and model...")
+    print("Loading data and model")
     
     # Load test set (from dataset.py)
     _, _, test_loader = get_dataloaders(
@@ -141,8 +210,7 @@ def main():
         num_classes=Config.NUM_CLASSES,
     )
     
-    # Initialize model (from modules.py)
-    # Note: Using the same dropout_p=0.2 from your train.py configuration
+    # Initialize model
     model = UNet3D(in_channels=1, out_channels=Config.NUM_CLASSES, dropout_p=0.2) 
     
     # Load checkpoint
@@ -152,20 +220,21 @@ def main():
     
     print(f"Loaded checkpoint from {Config.CHECKPOINT_PATH}")
     
-    # Evaluate
-    mean_dice, dice_per_class = evaluate_model(model, test_loader, Config.DEVICE)
+    # Evaluate - uses the new return values
+    mean_dice_all, dice_per_class_all = evaluate_model(model, test_loader, Config.DEVICE)
     
     # Save summary
     os.makedirs(Config.VIS_DIR, exist_ok=True)
-    with open(os.path.join(Config.VIS_DIR, "dice_scores.txt"), "w") as f:
-        f.write(f"Overall Mean Dice (no background): {mean_dice:.4f}\n")
+    with open(os.path.join(Config.VIS_DIR, "dice_scores_all_classes.txt"), "w") as f:
+        f.write(f"Overall Mean Dice (ALL classes): {mean_dice_all:.4f}\n")
         
         # Save class-wise scores
-        class_labels = range(1, Config.NUM_CLASSES)
-        for i, d in zip(class_labels, dice_per_class):
+        class_labels = range(Config.NUM_CLASSES) # Includes class 0
+        for i, d in zip(class_labels, dice_per_class_all):
             f.write(f"Class {i}: {d:.4f}\n")
     
-    print(f"\nResults saved to {Config.VIS_DIR}/dice_scores.txt")
+    print(f"\nResults saved to {Config.VIS_DIR}/dice_scores_all_classes.txt")
 
+# Main router for file
 if __name__ == "__main__":
     main()
